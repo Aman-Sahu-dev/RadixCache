@@ -1,0 +1,16 @@
+# Rust build artifacts
+target/
+
+# Go build artifacts
+go-workload/bin/
+go-workload/*.out
+
+# Environment and editor files
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/
+
+# OS files
+.DS_Store

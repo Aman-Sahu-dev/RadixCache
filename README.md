@@ -1,132 +1,205 @@
 
 # RadixCache
 
-**A request-aware memory manager for LLM prefix caching, built with Rust and Go.**
+> **Status: experimental design / in progress.**\
+> A Rust project exploring fixed-size KV-cache block allocation and
+> reuse through a flat global index, with a per-request vector of block
+> references.
 
-RadixCache explores how shared-prefix caching and explicit memory management can reduce duplicated KV-cache storage across concurrent inference requests.
+## Overview
 
-The project focuses on memory allocation, prefix reuse, safe reclamation, and performance measurement rather than building a complete inference server.
+RadixCache explores an alternative to representing cached token prefixes
+with an explicit radix tree.
 
-## Motivation
+The proposed design separates three responsibilities:
 
-LLM inference repeatedly processes token sequences that may share common prefixes. When requests have the same token prefix, their corresponding KV-cache entries may be reusable instead of being stored independently.
+1.  **Block allocator** --- owns a pool of fixed-size memory blocks and
+    reuses released blocks.
+2.  **Global block index** --- maps a block identity to the logical
+    block allocated for that content.
+3.  **Request block vector** --- records the ordered blocks a request
+    uses.
 
-For example:
+The goal is to investigate whether this flatter representation can
+provide a simpler implementation and competitive lookup, allocation, and
+reclamation performance compared with a tree-based baseline.
 
-```text
-Request A: The cat
-Request B: The cat is sleeping
-Request C: The cat is drinking tea
+This repository is an infrastructure experiment, not an LLM
+implementation. The initial work can use simulated KV-cache blocks and
+workloads without requiring a running model or GPU.
+
+## Design
+
+``` text
+Incoming token IDs
+        |
+        v
+Split into fixed-size token blocks
+        |
+        v
+Compute a chained key for each block
+        |
+        v
+Global index: BlockKey -> BlockId
+        |
+        +---- hit ----> reuse an eligible cached block
+        |
+        +---- miss ---> allocate a block and publish its identity
+        |
+        v
+Request-local Vec<BlockId>
+        |
+        v
+Inference engine resolves block IDs to physical storage
 ```
 
-The prefix `The cat` can be represented once and shared by all three requests.
+The diagram describes the intended flow. Physical addresses, logical
+block IDs, and cache keys are distinct concepts and should not be
+treated as interchangeable.
 
-RadixCache uses a radix tree to organize cached prefixes and associate them with their corresponding cache blocks. When a request finishes, its private blocks can be reclaimed while shared blocks remain available to other requests.
+### Fixed-size blocks
 
-## Goals
+Each block stores KV data for a configured number of tokens. The byte
+size of a block depends on the model configuration, including the number
+of layers, KV heads, head dimension, and data type.
 
-- Implement radix-tree-based prefix lookup and sharing.
-- Manage cache memory through fixed-size blocks.
-- Track shared ownership and reclaim blocks safely.
-- Handle requests with overlapping lifetimes.
-- Measure memory usage, cache reuse, allocation overhead, and reclamation performance.
-- Compare the implementation against a baseline without prefix sharing.
+Fixed-size blocks simplify allocation and free-list management. The
+allocator does not need to understand tokenization or model
+computations; it manages storage and block lifecycle.
 
-## Architecture
+### Chained block keys
 
-### Rust: Cache Engine
+For block-sized token chunks, a key can incorporate both the current
+chunk and the preceding prefix:
 
-The Rust engine is responsible for:
+``` text
+key_0 = hash(model/config identity, tokens[0..B])
+key_1 = hash(key_0, tokens[B..2B])
+key_2 = hash(key_1, tokens[2B..3B])
+```
 
-- Radix-tree indexing and prefix lookup.
-- Fixed-size block allocation and reuse.
-- Mapping cached prefixes to KV-cache blocks.
-- Tracking references to shared cache entries.
-- Reclaiming blocks when they are no longer needed.
+Here, `B` is the number of tokens per block.
 
-### Go: Workload Generator
+This lets identical token prefixes produce matching block keys. Keys
+must include relevant model and execution configuration, and the
+implementation must account for hash collisions rather than assuming
+hashes are mathematically unique.
 
-The Go component generates synthetic inference workloads and measures their behavior.
+### Request-local block vectors
 
-It will support:
+A request maintains an ordered vector of logical block references:
 
-- Configurable request counts and token-prefix overlap.
-- Concurrent request lifetimes.
-- Repeated and partially shared prefixes.
-- Collection of memory and performance metrics.
+``` rust
+Vec<BlockId>
+```
 
-The initial implementation uses simulated KV-cache blocks and does not require a GPU or an actual LLM runtime.
+The vector describes the blocks used by that request. It is not itself
+the KV data, and a `BlockId` is not necessarily a raw physical address.
+Keeping identity separate from physical location allows the allocator to
+manage storage safely.
 
-## Design Boundaries
+### Allocation and reclamation
 
-RadixCache is a cache and memory-management experiment, not an inference server.
+On a cache miss, the manager obtains a free block or allocates one, then
+publishes the mapping. When a request finishes, it releases the
+references it holds.
 
-It does not initially implement:
+A block may be returned to the free pool only when no active request or
+cache-retention policy still requires it. Reclamation, reference
+tracking, and concurrent lookup/publication are part of the design, not
+assumed to be solved by dropping a vector.
 
-- Neural-network inference.
-- GPU kernels or hardware-specific memory management.
-- Request batching or inference scheduling.
-- Model loading or token generation.
-- Distributed caching.
+## Core invariants
 
-These can be considered separately if the core experiment justifies them.
+-   A logical block ID refers to at most one currently allocated block.
+-   A block cannot be reused while an active request still holds a
+    reference to it.
+-   A cache key identifies the relevant token prefix and model/execution
+    configuration, not merely an individual token ID.
+-   Hash collisions are checked or handled safely.
+-   Request vectors preserve block order.
+-   Lookup, allocation, publication, and reclamation remain consistent
+    under concurrent access.
+-   The allocator manages storage; it does not compute KV tensors or
+    decide model semantics.
 
-## Planned Benchmarks
+## Scope
 
-RadixCache will evaluate:
+### In scope
 
-| Metric | Purpose |
-|---|---|
-| Peak allocated blocks | Measure maximum cache memory demand |
-| Cache hit rate | Measure successful prefix reuse |
-| Allocation latency | Measure the cost of obtaining blocks |
-| Reclamation latency | Measure the cost of releasing request-owned memory |
-| Memory fragmentation | Measure wasted capacity in the block pool |
-| Prefix lookup latency | Measure radix-tree lookup performance |
+-   Fixed-size block pool and free list.
+-   Global block index.
+-   Chained block-key generation.
+-   Per-request block vectors.
+-   Cache-hit and cache-miss paths.
+-   Reference tracking and safe block reclamation.
+-   A no-sharing baseline for comparison.
+-   Workload replay and benchmarks for lookup latency, allocation cost,
+    memory overhead, and reuse rate.
 
-Results will be compared against a baseline that stores request prefixes independently. Workloads will vary in prefix overlap, request duration, and concurrency.
+### Out of scope initially
 
-## Project Structure
+-   Implementing a language model or tokenizer.
+-   Computing attention or KV tensors.
+-   Building a frontend.
+-   GPU-specific integration before the core data model and benchmarks
+    are validated.
 
-```text
-radixcache/
+## Evaluation
+
+The flat design should be compared against a simple baseline and, where
+useful, a radix-tree-based implementation using the same workloads.
+
+Measure at least:
+
+-   Lookup latency for cache hits and misses.
+-   Allocation and release latency.
+-   Memory used by metadata and block storage.
+-   Cache reuse rate under repeated and overlapping prefixes.
+-   Behavior under concurrent requests and eviction.
+-   Correctness under block reuse and hash-collision tests.
+
+No performance advantage is assumed in advance. The purpose of the
+project is to measure the trade-offs.
+
+## Repository layout
+
+The planned layout is:
+
+``` text
+.
+├── README.md
+├── docs/
+│   ├── design.md
+│   └── benchmarks.md
 ├── rust-engine/
-│   ├── Cargo.toml
-│   ├── src/
-│   │   ├── lib.rs
-│   │   ├── radix_tree.rs
-│   │   ├── block_pool.rs
-│   │   ├── prefix_cache.rs
-│   │   └── request.rs
-│   └── benches/
+│   └── ...
 └── go-workload/
-    ├── go.mod
-    ├── main.go
-    ├── workload.go
-    └── metrics.go
+    └── ...
 ```
 
-The structure may evolve as the ownership model and benchmark requirements become clearer.
+-   `rust-engine/`: block allocator, index, request tracking, and
+    replay/benchmark logic.
+-   `go-workload/`: workload generation for repeatable cache
+    experiments.
+-   `docs/design.md`: ownership rules, invariants, and design decisions.
+-   `docs/benchmarks.md`: benchmark methodology, workloads, and measured
+    results.
 
-## Technology Stack
+Adjust this layout to match the actual repository as implementation
+evolves.
 
-- **Rust:** cache engine and explicit memory management.
-- **Go:** workload generation and benchmark orchestration.
-- **Criterion:** Rust microbenchmarks.
-- **proptest:** property-based testing of cache invariants.
-- **tracing:** instrumentation and diagnostic events.
+## Development approach
 
-The first version uses standard-library data structures wherever practical.
+1.  Implement and test the fixed-size block allocator.
+2.  Add the global index and chained block keys.
+3.  Track request-owned block references in vectors.
+4.  Implement release and free-list reuse.
+5.  Add a no-sharing baseline and reproducible workloads.
+6.  Test correctness under collisions, eviction, and concurrent
+    requests.
+7.  Benchmark before making optimization claims.
 
-## Development Status
-
-**Status: Initial design**
-
-The project is currently in the design and implementation-planning stage. The architecture and benchmark goals are planned; implementation and performance results have not yet been established.
-
-## Long-Term Direction
-
-The objective is to determine how prefix indexing, block allocation, ownership tracking, and reclamation policies affect cache efficiency under realistic request patterns.
-
-Any performance improvements will be reported against defined baselines and reproducible workloads.
-
+The central question is whether a flat index plus request-local block
+vectors offers a worthwhile simplicity/performance trade-off for the
+target workloads.
